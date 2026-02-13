@@ -7,25 +7,20 @@
 package auth
 
 import (
-	"context"
+	"bytes"
 	"errors"
+	"io"
 	"net/http"
 	"sync"
 
-	"github.com/modelcontextprotocol/go-sdk/oauthex"
 	"golang.org/x/oauth2"
 )
 
 // An OAuthHandler conducts an OAuth flow and returns a [oauth2.TokenSource] if the authorization
 // is approved, or an error if not.
-type OAuthHandler func(context.Context, OAuthHandlerArgs) (oauth2.TokenSource, error)
-
-// OAuthHandlerArgs are arguments to an [OAuthHandler].
-type OAuthHandlerArgs struct {
-	// The URL to fetch protected resource metadata, extracted from the WWW-Authenticate header.
-	// Empty if not present or there was an error obtaining it.
-	ResourceMetadataURL string
-}
+// The handler receives the HTTP request and response that triggered the authentication flow.
+// To obtain the protected resource metadata, call [oauthex.GetProtectedResourceMetadataFromHeader].
+type OAuthHandler func(req *http.Request, res *http.Response) (oauth2.TokenSource, error)
 
 // HTTPTransport is an [http.RoundTripper] that follows the MCP
 // OAuth protocol when it encounters a 401 Unauthorized response.
@@ -67,6 +62,28 @@ func (t *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	base := t.opts.Base
 	t.mu.Unlock()
 
+	var (
+		// If haveBody is set, the request has a nontrivial body, and we need avoid
+		// reading (or closing) it multiple times. In that case, bodyBytes is its
+		// content.
+		haveBody  bool
+		bodyBytes []byte
+	)
+	if req.Body != nil && req.Body != http.NoBody {
+		// if we're setting Body, we must mutate first.
+		req = req.Clone(req.Context())
+		haveBody = true
+		var err error
+		bodyBytes, err = io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		// Now that we've read the request body, http.RoundTripper requires that we
+		// close it.
+		req.Body.Close() // ignore error
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+
 	resp, err := base.RoundTrip(req)
 	if err != nil {
 		return nil, err
@@ -88,22 +105,19 @@ func (t *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// TODO: We hold the lock for the entire OAuth flow. This could be a long
 	// time. Is there a better way?
 	if _, ok := t.opts.Base.(*oauth2.Transport); !ok {
-		authHeaders := resp.Header[http.CanonicalHeaderKey("WWW-Authenticate")]
-		ts, err := t.handler(req.Context(), OAuthHandlerArgs{
-			ResourceMetadataURL: extractResourceMetadataURL(authHeaders),
-		})
+		ts, err := t.handler(req, resp)
 		if err != nil {
 			return nil, err
 		}
 		t.opts.Base = &oauth2.Transport{Base: t.opts.Base, Source: ts}
 	}
-	return t.opts.Base.RoundTrip(req.Clone(req.Context()))
-}
 
-func extractResourceMetadataURL(authHeaders []string) string {
-	cs, err := oauthex.ParseWWWAuthenticate(authHeaders)
-	if err != nil {
-		return ""
+	// If we don't have a body, the request is reusable, though it will be cloned
+	// by the base. However, if we've had to read the body, we must clone.
+	if haveBody {
+		req = req.Clone(req.Context())
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
-	return oauthex.ResourceMetadataURL(cs)
+
+	return t.opts.Base.RoundTrip(req)
 }

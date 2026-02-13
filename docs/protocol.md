@@ -148,6 +148,7 @@ To create a streamable MCP server, you create a `StreamableHTTPHandler` and
 pass it an `mcp.Server`:
 
 ```go
+// TODO: Until we have a way to clean up abandoned sessions, this test will leak goroutines (see #499)
 func ExampleStreamableHTTPHandler() {
 	// Create a new streamable handler, using the same MCP server for every request.
 	//
@@ -184,6 +185,19 @@ client, err := mcp.Connect(ctx, transport, &mcp.ClientOptions{...})
 
 The `StreamableClientTransport` handles the HTTP requests and communicates with
 the server using the streamable transport protocol.
+
+#### Resumability and Redelivery
+
+By default, the streamable server does not support [resumability or
+redelivery](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#resumability-and-redelivery)
+of messages, because doing so requires either a persistent storage solution or
+unbounded memory usage (see also
+[#580](https://github.com/modelcontextprotocol/go-sdk/issues/580)).
+
+To enable resumability, set `StreamableHTTPOptions.EventStore` to a non-nil
+value. The SDK provides a `MemoryEventStore` for testing or simple use cases;
+for production use it is generally advisable to use a more sophisticated
+implementation.
 
 #### Stateless Mode
 
@@ -259,7 +273,34 @@ from `req.Extra.TokenInfo`, where `req` is the handler's request. (For example, 
 [`CallToolRequest`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/mcp#CallToolRequest).)
 HTTP handlers wrapped by the `RequireBearerToken` middleware can obtain the `TokenInfo` from the context
 with [`auth.TokenInfoFromContext`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/auth#TokenInfoFromContext).
- 
+
+#### OAuth Protected Resource Metadata
+
+Servers implementing OAuth 2.0 authorization should expose a protected resource metadata endpoint
+as specified in [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728). This endpoint provides
+clients with information about the resource server's OAuth configuration, including which
+authorization servers can be used and what scopes are supported.
+
+The SDK provides [`ProtectedResourceMetadataHandler`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/auth#ProtectedResourceMetadataHandler)
+to serve this metadata. The handler automatically sets CORS headers (`Access-Control-Allow-Origin: *`)
+to support cross-origin client discovery, as the metadata contains only public configuration information.
+
+Example usage:
+
+```go
+metadata := &oauthex.ProtectedResourceMetadata{
+    Resource: "https://example.com/mcp",
+    AuthorizationServers: []string{
+        "https://auth.example.com/.well-known/openid-configuration",
+    },
+    ScopesSupported: []string{"read", "write"},
+}
+http.Handle("/.well-known/oauth-protected-resource",
+    auth.ProtectedResourceMetadataHandler(metadata))
+```
+
+For more sophisticated CORS policies, wrap the handler with a CORS middleware like
+[github.com/rs/cors](https://github.com/rs/cors) or [github.com/jub0bs/cors](https://github.com/jub0bs/cors).
 
 The  [_auth middleware example_](https://github.com/modelcontextprotocol/go-sdk/tree/main/examples/server/auth-middleware) shows how to implement authorization for both JWT tokens and API keys.
 
@@ -302,9 +343,18 @@ If you create your own with
 If you are using Go 1.24 or above,
 we recommend using [`crypto/rand.Text`](https://pkg.go.dev/crypto/rand#Text) 
 
-- _Binding session IDs to user information_. This is an application requirement, out of scope
-for the SDK. You can create your own session IDs by setting
-[`ServerOptions.GetSessionID`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/mcp#ServerOptions.GetSessionID).
+- _Binding session IDs to user information_. The SDK supports this mitigation through
+[`TokenInfo.UserID`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/auth#TokenInfo.UserID).
+When a [`TokenVerifier`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/auth#TokenVerifier)
+sets `UserID` on the returned `TokenInfo`, the streamable transport will:
+  1. Store the user ID when a new session is created.
+  2. Verify that subsequent requests to that session include a token with the same `UserID`.
+  3. Reject requests with a 403 Forbidden if the user ID doesn't match.
+
+  **Recommendation**: If your `TokenVerifier` can extract a user identifier from the token
+  (such as a `sub` claim in a JWT, or a user ID associated with an API key), set
+  `TokenInfo.UserID` to enable this protection. This prevents an attacker with a valid
+  token from hijacking another user's session by guessing or obtaining their session ID.
 
 ## Utilities
 

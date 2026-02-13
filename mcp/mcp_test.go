@@ -24,7 +24,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/jsonschema-go/jsonschema"
-	"github.com/modelcontextprotocol/go-sdk/internal/jsonrpc2"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 )
 
 type hiParams struct {
@@ -56,15 +56,19 @@ func codReviewPromptHandler(_ context.Context, req *GetPromptRequest) (*GetPromp
 	}, nil
 }
 
+// TODO: remove this test when Go 1.24 support is dropped (use go1.25 synctest version).
 func TestEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	var ct, st Transport = NewInMemoryTransports()
 
 	// Channels to check if notification callbacks happened.
+	// These test asynchronous sending of notifications after a small delay (see
+	// Server.sendNotification).
 	notificationChans := map[string]chan int{}
-	for _, name := range []string{"initialized", "roots", "tools", "prompts", "resources", "progress_server", "progress_client", "resource_updated", "subscribe", "unsubscribe"} {
+	for _, name := range []string{"initialized", "roots", "tools", "prompts", "resources", "progress_server", "progress_client", "resource_updated", "subscribe", "unsubscribe", "elicitation_complete"} {
 		notificationChans[name] = make(chan int, 1)
 	}
+
 	waitForNotification := func(t *testing.T, name string) {
 		t.Helper()
 		select {
@@ -149,6 +153,9 @@ func TestEndToEnd(t *testing.T) {
 		},
 		ResourceUpdatedHandler: func(context.Context, *ResourceUpdatedNotificationRequest) {
 			notificationChans["resource_updated"] <- 0
+		},
+		ElicitationCompleteHandler: func(_ context.Context, req *ElicitationCompleteNotificationRequest) {
+			notificationChans["elicitation_complete"] <- 0
 		},
 	}
 	c := NewClient(testImpl, opts)
@@ -312,7 +319,7 @@ func TestEndToEnd(t *testing.T) {
 		} {
 			rres, err := cs.ReadResource(ctx, &ReadResourceParams{URI: tt.uri})
 			if err != nil {
-				if code := errorCode(err); code == codeResourceNotFound {
+				if code := errorCode(err); code == CodeResourceNotFound {
 					if tt.mimeType != "" {
 						t.Errorf("%s: not found but expected it to be", tt.uri)
 					}
@@ -572,7 +579,7 @@ func errorCode(err error) int64 {
 	if err == nil {
 		return 0
 	}
-	var werr *jsonrpc2.WireError
+	var werr *jsonrpc.Error
 	if errors.As(err, &werr) {
 		return werr.Code
 	}
@@ -666,6 +673,7 @@ func TestServerClosing(t *testing.T) {
 	}
 }
 
+// TODO: remove this test when Go 1.24 support is dropped (use go1.25 synctest version).
 func TestBatching(t *testing.T) {
 	ctx := context.Background()
 	ct, st := NewInMemoryTransports()
@@ -704,6 +712,7 @@ func TestBatching(t *testing.T) {
 	}
 }
 
+// TODO: remove this test when Go 1.24 support is dropped (use go1.25 synctest version).
 func TestCancellation(t *testing.T) {
 	var (
 		start     = make(chan struct{})
@@ -897,6 +906,7 @@ func nopHandler(context.Context, *CallToolRequest) (*CallToolResult, error) {
 	return nil, nil
 }
 
+// TODO: remove this test when Go 1.24 support is dropped (use go1.25 synctest version).
 func TestKeepAlive(t *testing.T) {
 	// TODO: try to use the new synctest package for this test once we upgrade to Go 1.24+.
 	// synctest would allow us to control time and avoid the time.Sleep calls, making the test
@@ -985,12 +995,17 @@ func TestElicitationUnsupportedMethod(t *testing.T) {
 	if err == nil {
 		t.Error("expected error when ElicitationHandler is not provided, got nil")
 	}
-	if code := errorCode(err); code != codeUnsupportedMethod {
-		t.Errorf("got error code %d, want %d (CodeUnsupportedMethod)", code, codeUnsupportedMethod)
+	if code := errorCode(err); code != -1 {
+		t.Errorf("got error code %d, want -1", code)
 	}
 	if !strings.Contains(err.Error(), "does not support elicitation") {
 		t.Errorf("error should mention unsupported elicitation, got: %v", err)
 	}
+}
+
+func anyPtr[T any](v T) *any {
+	var a any = v
+	return &a
 }
 
 func TestElicitationSchemaValidation(t *testing.T) {
@@ -1109,6 +1124,37 @@ func TestElicitationSchemaValidation(t *testing.T) {
 						},
 						Extra: map[string]any{
 							"enumNames": []any{"High Priority", "Medium Priority", "Low Priority"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "enum with enum schema",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"priority": {
+						Type: "string",
+						OneOf: []*jsonschema.Schema{
+							{
+								Const: anyPtr(map[string]string{
+									"const": "high",
+									"title": "High Priority",
+								}),
+							},
+							{
+								Const: anyPtr(map[string]string{
+									"const": "medium",
+									"title": "Medium Priority",
+								}),
+							},
+							{
+								Const: anyPtr(map[string]string{
+									"const": "low",
+									"title": "Low Priority",
+								}),
+							},
 						},
 					},
 				},
@@ -1254,7 +1300,37 @@ func TestElicitationSchemaValidation(t *testing.T) {
 					"enabled": {Type: "boolean", Default: json.RawMessage(`"not-a-boolean"`)},
 				},
 			},
-			expectedError: "elicit schema property \"enabled\" has invalid default value, must be a boolean",
+			expectedError: "elicit schema property \"enabled\" has invalid default value, must be a bool",
+		},
+		{
+			name: "string with invalid default",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"enabled": {Type: "string", Default: json.RawMessage("true")},
+				},
+			},
+			expectedError: "elicit schema property \"enabled\" has invalid default value, must be a string",
+		},
+		{
+			name: "integer with invalid default",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"enabled": {Type: "integer", Default: json.RawMessage("true")},
+				},
+			},
+			expectedError: "elicit schema property \"enabled\" has default value that cannot be interpreted as an int or float",
+		},
+		{
+			name: "number with invalid default",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"enabled": {Type: "number", Default: json.RawMessage("true")},
+				},
+			},
+			expectedError: "elicit schema property \"enabled\" has default value that cannot be interpreted as an int or float",
 		},
 		{
 			name: "enum with mismatched enumNames length",
@@ -1333,11 +1409,101 @@ func TestElicitationSchemaValidation(t *testing.T) {
 				t.Errorf("expected error for invalid schema %q, got nil", tc.name)
 				return
 			}
-			if code := errorCode(err); code != codeInvalidParams {
-				t.Errorf("got error code %d, want %d (CodeInvalidParams)", code, codeInvalidParams)
+			if code := errorCode(err); code != jsonrpc.CodeInvalidParams {
+				t.Errorf("got error code %d, want %d (CodeInvalidParams)", code, jsonrpc.CodeInvalidParams)
 			}
 			if !strings.Contains(err.Error(), tc.expectedError) {
 				t.Errorf("error message %q does not contain expected text %q", err.Error(), tc.expectedError)
+			}
+		})
+	}
+}
+
+func TestElicitContentValidation(t *testing.T) {
+	ctx := context.Background()
+	ct, st := NewInMemoryTransports()
+
+	s := NewServer(testImpl, nil)
+	ss, err := s.Connect(ctx, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Set up a client that exercises valid/invalid elicitation: the returned
+	// Content from the handler ("potato") is validated against the schemas
+	// defined in the testcases below.
+	c := NewClient(testImpl, &ClientOptions{
+		ElicitationHandler: func(context.Context, *ElicitRequest) (*ElicitResult, error) {
+			return &ElicitResult{Action: "accept", Content: map[string]any{"test": "potato"}}, nil
+		},
+	})
+	cs, err := c.Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+
+	testcases := []struct {
+		name          string
+		schema        *jsonschema.Schema
+		expectedError string
+	}{
+		{
+			name: "string enum with schema not matching content",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"test": {
+						Type: "string",
+						OneOf: []*jsonschema.Schema{
+							{
+								Const: anyPtr(map[string]string{
+									"const": "high",
+									"title": "High Priority",
+								}),
+							},
+						},
+					},
+				},
+			},
+			expectedError: "oneOf: did not validate against any of",
+		},
+		{
+			name: "string enum with schema matching content",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"test": {
+						Type: "string",
+						OneOf: []*jsonschema.Schema{
+							{
+								Const: anyPtr(map[string]string{
+									"const": "potato",
+									"title": "Potato Priority",
+								}),
+							},
+						},
+					},
+				},
+			},
+			expectedError: "",
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ss.Elicit(ctx, &ElicitParams{
+				Message:         "Test schema: " + tc.name,
+				RequestedSchema: tc.schema,
+			})
+			if tc.expectedError != "" {
+				if err == nil {
+					t.Errorf("expected error but got no error: %s", tc.expectedError)
+					return
+				}
+				if !strings.Contains(err.Error(), tc.expectedError) {
+					t.Errorf("error message %q does not contain expected text %q", err.Error(), tc.expectedError)
+				}
 			}
 		})
 	}
@@ -1384,7 +1550,7 @@ func TestElicitationProgressToken(t *testing.T) {
 func TestElicitationCapabilityDeclaration(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("with_handler", func(t *testing.T) {
+	t.Run("with handler", func(t *testing.T) {
 		ct, st := NewInMemoryTransports()
 
 		// Client with ElicitationHandler should declare capability
@@ -1421,7 +1587,7 @@ func TestElicitationCapabilityDeclaration(t *testing.T) {
 		}
 	})
 
-	t.Run("without_handler", func(t *testing.T) {
+	t.Run("without handler", func(t *testing.T) {
 		ct, st := NewInMemoryTransports()
 
 		// Client without ElicitationHandler should not declare capability
@@ -1453,12 +1619,107 @@ func TestElicitationCapabilityDeclaration(t *testing.T) {
 		if err == nil {
 			t.Error("expected UnsupportedMethod error when no capability declared")
 		}
-		if code := errorCode(err); code != codeUnsupportedMethod {
-			t.Errorf("got error code %d, want %d (CodeUnsupportedMethod)", code, codeUnsupportedMethod)
+		if code := errorCode(err); code != -1 {
+			t.Errorf("got error code %d, want -1", code)
 		}
 	})
 }
 
+func TestElicitationDefaultValues(t *testing.T) {
+	ctx := context.Background()
+	ct, st := NewInMemoryTransports()
+
+	s := NewServer(testImpl, nil)
+	ss, err := s.Connect(ctx, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	c := NewClient(testImpl, &ClientOptions{
+		ElicitationHandler: func(context.Context, *ElicitRequest) (*ElicitResult, error) {
+			return &ElicitResult{Action: "accept", Content: map[string]any{"default": "response"}}, nil
+		},
+	})
+	cs, err := c.Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+
+	testcases := []struct {
+		name     string
+		schema   *jsonschema.Schema
+		expected map[string]any
+	}{
+		{
+			name: "boolean with default",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"key": {Type: "boolean", Default: json.RawMessage("true")},
+				},
+			},
+			expected: map[string]any{"key": true, "default": "response"},
+		},
+		{
+			name: "string with default",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"key": {Type: "string", Default: json.RawMessage("\"potato\"")},
+				},
+			},
+			expected: map[string]any{"key": "potato", "default": "response"},
+		},
+		{
+			name: "integer with default",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"key": {Type: "integer", Default: json.RawMessage("123")},
+				},
+			},
+			expected: map[string]any{"key": float64(123), "default": "response"},
+		},
+		{
+			name: "number with default",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"key": {Type: "number", Default: json.RawMessage("89.7")},
+				},
+			},
+			expected: map[string]any{"key": float64(89.7), "default": "response"},
+		},
+		{
+			name: "enum with default",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"key": {Type: "string", Enum: []any{"one", "two"}, Default: json.RawMessage("\"one\"")},
+				},
+			},
+			expected: map[string]any{"key": "one", "default": "response"},
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := ss.Elicit(ctx, &ElicitParams{
+				Message:         "Test schema with defaults: " + tc.name,
+				RequestedSchema: tc.schema,
+			})
+			if err != nil {
+				t.Fatalf("expected no error for default schema %q, got: %v", tc.name, err)
+			}
+			if diff := cmp.Diff(tc.expected, res.Content); diff != "" {
+				t.Errorf("%s: did not get expected value, -want +got:\n%s", tc.name, diff)
+			}
+		})
+	}
+}
+
+// TODO: remove this test when Go 1.24 support is dropped (use go1.25 synctest version).
 func TestKeepAliveFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1542,15 +1803,17 @@ func TestAddTool_DuplicateNoPanicAndNoDuplicate(t *testing.T) {
 	}
 }
 
+// TODO: remove this test when Go 1.24 support is dropped (use go1.25 synctest version).
 func TestSynchronousNotifications(t *testing.T) {
-	var toolsChanged atomic.Bool
+	var toolsChanged atomic.Int32
 	clientOpts := &ClientOptions{
 		ToolListChangedHandler: func(ctx context.Context, req *ToolListChangedRequest) {
-			toolsChanged.Store(true)
+			toolsChanged.Add(1)
 		},
 		CreateMessageHandler: func(ctx context.Context, req *CreateMessageRequest) (*CreateMessageResult, error) {
-			if !toolsChanged.Load() {
-				return nil, fmt.Errorf("didn't get a tools changed notification")
+			// See the comment after "from server" below.
+			if n := toolsChanged.Load(); n != 1 {
+				return nil, fmt.Errorf("got %d tools-changed notification, wanted 1", n)
 			}
 			// TODO(rfindley): investigate the error returned from this test if
 			// CreateMessageResult is new(CreateMessageResult): it's a mysterious
@@ -1567,14 +1830,15 @@ func TestSynchronousNotifications(t *testing.T) {
 		},
 	}
 	server := NewServer(testImpl, serverOpts)
-	cs, ss, cleanup := basicClientServerConnection(t, client, server, func(s *Server) {
+	addTool := func(s *Server) {
 		AddTool(s, &Tool{Name: "tool"}, func(ctx context.Context, req *CallToolRequest, args any) (*CallToolResult, any, error) {
 			if !rootsChanged.Load() {
 				return nil, nil, fmt.Errorf("didn't get root change notification")
 			}
 			return new(CallToolResult), nil, nil
 		})
-	})
+	}
+	cs, ss, cleanup := basicClientServerConnection(t, client, server, addTool)
 	defer cleanup()
 
 	t.Run("from client", func(t *testing.T) {
@@ -1589,13 +1853,20 @@ func TestSynchronousNotifications(t *testing.T) {
 	})
 
 	t.Run("from server", func(t *testing.T) {
-		server.RemoveTools("tool")
+		// Despite all this tool-changed activity, we expect only one notification.
+		for range 10 {
+			server.RemoveTools("tool")
+			addTool(server)
+		}
+
+		time.Sleep(notificationDelay * 2) // Wait for delayed notification.
 		if _, err := ss.CreateMessage(context.Background(), new(CreateMessageParams)); err != nil {
 			t.Errorf("CreateMessage failed: %v", err)
 		}
 	})
 }
 
+// TODO: remove this test when Go 1.24 support is dropped (use go1.25 synctest version).
 func TestNoDistributedDeadlock(t *testing.T) {
 	// This test verifies that calls are asynchronous, and so it's not possible
 	// to have a distributed deadlock.
@@ -1860,7 +2131,7 @@ func TestToolErrorMiddleware(t *testing.T) {
 			res, err := h(ctx, method, req)
 			if err == nil {
 				if ctr, ok := res.(*CallToolResult); ok {
-					middleErr = ctr.getError()
+					middleErr = ctr.GetError()
 				}
 			}
 			return res, err
@@ -1897,7 +2168,7 @@ func TestToolErrorMiddleware(t *testing.T) {
 		t.Fatal("want error, got none")
 	}
 	// Clients can't see the error, because it isn't marshaled.
-	if err := res.getError(); err != nil {
+	if err := res.GetError(); err != nil {
 		t.Fatalf("got %v, want nil", err)
 	}
 	if middleErr != errTestFailure {

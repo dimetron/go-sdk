@@ -33,7 +33,7 @@ func ExampleLoggingTransport() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer serverSession.Wait()
+	defer serverSession.Close()
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "client", Version: "v0.0.1"}, nil)
 	var b bytes.Buffer
@@ -51,7 +51,7 @@ func ExampleLoggingTransport() {
 
 	// Output:
 	// read: {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"logging":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"server","version":"v0.0.1"}}}
-	// write: {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"client","version":"v0.0.1"},"protocolVersion":"2025-06-18"}}
+	// write: {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"client","version":"v0.0.1"},"protocolVersion":"2025-06-18","capabilities":{"roots":{"listChanged":true}}}}
 	// write: {"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
 }
 ```
@@ -71,7 +71,7 @@ func ExampleStreamableHTTPHandler_middleware() {
 	server := mcp.NewServer(&mcp.Implementation{Name: "server", Version: "v0.1.0"}, nil)
 	handler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		return server
-	}, nil)
+	}, &mcp.StreamableHTTPOptions{Stateless: true})
 	loggingHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// Example debugging; you could also capture the response.
 		body, err := io.ReadAll(req.Body)

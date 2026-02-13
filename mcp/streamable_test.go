@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -516,6 +517,92 @@ func testClientReplay(t *testing.T, test clientReplayTest) {
 	}
 }
 
+func TestStreamableServerDisconnect(t *testing.T) {
+	server := NewServer(testImpl, nil)
+
+	// Test that client replayability allows the server to terminate incoming
+	// requests immediately, and have the client replay them.
+
+	// testStream exercises stream resumption by interleaving stream termination
+	// with progress notifications.
+	testStream := func(ctx context.Context, session *ServerSession, extra *RequestExtra) {
+		// Close the stream before the first message. We should have sent an
+		// initial priming message already, so the client will be able to replay
+		extra.CloseSSEStream(CloseSSEStreamArgs{RetryAfter: 10 * time.Millisecond})
+		session.NotifyProgress(ctx, &ProgressNotificationParams{Message: "msg1"})
+		time.Sleep(20 * time.Millisecond)
+		extra.CloseSSEStream(CloseSSEStreamArgs{RetryAfter: 10 * time.Millisecond}) // Closing twice should still be supported.
+		session.NotifyProgress(ctx, &ProgressNotificationParams{Message: "msg2"})
+	}
+
+	AddTool(server, &Tool{Name: "disconnect"},
+		func(ctx context.Context, req *CallToolRequest, args map[string]any) (*CallToolResult, map[string]any, error) {
+			testStream(ctx, req.Session, req.Extra)
+			return new(CallToolResult), nil, nil
+		})
+
+	server.AddPrompt(&Prompt{Name: "disconnect"}, func(ctx context.Context, req *GetPromptRequest) (*GetPromptResult, error) {
+		testStream(ctx, req.Session, req.Extra)
+		return nil, nil
+	})
+
+	tests := []struct {
+		name   string
+		doCall func(context.Context, *ClientSession) error
+	}{
+		{
+			"tool",
+			func(ctx context.Context, cs *ClientSession) error {
+				_, err := cs.CallTool(ctx, &CallToolParams{Name: "disconnect"})
+				return err
+			},
+		},
+		{
+			"prompt",
+			func(ctx context.Context, cs *ClientSession) error {
+				_, err := cs.GetPrompt(ctx, &GetPromptParams{Name: "disconnect"})
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			notifications := make(chan string, 2)
+			handler := NewStreamableHTTPHandler(func(*http.Request) *Server { return server }, &StreamableHTTPOptions{
+				EventStore: NewMemoryEventStore(nil), // support replayability
+			})
+			httpServer := httptest.NewServer(mustNotPanic(t, handler))
+			defer httpServer.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client := NewClient(testImpl, &ClientOptions{
+				ProgressNotificationHandler: func(ctx context.Context, req *ProgressNotificationClientRequest) {
+					notifications <- req.Params.Message
+				},
+			})
+			clientSession, err := client.Connect(ctx, &StreamableClientTransport{
+				Endpoint: httpServer.URL,
+			}, &ClientSessionOptions{protocolVersion: protocolVersion20251125})
+			if err != nil {
+				t.Fatalf("client.Connect() failed: %v", err)
+			}
+			defer clientSession.Close()
+
+			if err = test.doCall(ctx, clientSession); err != nil {
+				t.Fatalf("CallTool failed: %v", err)
+			}
+
+			got := readNotifications(t, ctx, notifications, 2)
+			want := []string{"msg1", "msg2"}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("got unexpected notifications (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestServerTransportCleanup(t *testing.T) {
 	nClient := 3
 
@@ -581,8 +668,8 @@ func TestServerTransportCleanup(t *testing.T) {
 	}
 
 	handler.mu.Lock()
-	if len(handler.transports) != 0 {
-		t.Errorf("want empty transports map, find %v entries from handler's transports map", len(handler.transports))
+	if len(handler.sessions) != 0 {
+		t.Errorf("want empty transports map, find %v entries from handler's transports map", len(handler.sessions))
 	}
 	handler.mu.Unlock()
 }
@@ -593,14 +680,7 @@ func TestServerInitiatedSSE(t *testing.T) {
 	notifications := make(chan string)
 	server := NewServer(testImpl, nil)
 
-	opts := &StreamableHTTPOptions{
-		// TODO(#583): for now, this is required for guaranteed message delivery.
-		// However, it shouldn't be necessary to use replay here, as we should be
-		// guaranteed that the standalone SSE stream is started by the time the
-		// client is connected.
-		EventStore: NewMemoryEventStore(nil),
-	}
-	httpServer := httptest.NewServer(mustNotPanic(t, NewStreamableHTTPHandler(func(*http.Request) *Server { return server }, opts)))
+	httpServer := httptest.NewServer(mustNotPanic(t, NewStreamableHTTPHandler(func(*http.Request) *Server { return server }, nil)))
 	defer httpServer.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -672,7 +752,7 @@ func TestStreamableServerTransport(t *testing.T) {
 	// requests.
 
 	// Predefined steps, to avoid repetition below.
-	initReq := req(1, methodInitialize, &InitializeParams{})
+	initReq := req(1, methodInitialize, &InitializeParams{ProtocolVersion: protocolVersion20250618})
 	initResp := resp(1, &InitializeResult{
 		Capabilities: &ServerCapabilities{
 			Logging: &LoggingCapabilities{},
@@ -695,11 +775,36 @@ func TestStreamableServerTransport(t *testing.T) {
 		wantStatusCode: http.StatusAccepted,
 	}
 
+	// Protocol version 2025-11-25 variants, for testing prime/close events (SEP-1699).
+	initReq20251125 := req(1, methodInitialize, &InitializeParams{ProtocolVersion: protocolVersion20251125})
+	initResp20251125 := resp(1, &InitializeResult{
+		Capabilities: &ServerCapabilities{
+			Logging: &LoggingCapabilities{},
+			Tools:   &ToolCapabilities{ListChanged: true},
+		},
+		ProtocolVersion: protocolVersion20251125,
+		ServerInfo:      &Implementation{Name: "testServer", Version: "v1.0.0"},
+	}, nil)
+	initialize20251125 := streamableRequest{
+		method:         "POST",
+		messages:       []jsonrpc.Message{initReq20251125},
+		wantStatusCode: http.StatusOK,
+		wantMessages:   []jsonrpc.Message{initResp20251125},
+		wantSessionID:  true,
+	}
+	initialized20251125 := streamableRequest{
+		method:         "POST",
+		headers:        http.Header{protocolVersionHeader: {protocolVersion20251125}},
+		messages:       []jsonrpc.Message{initializedMsg},
+		wantStatusCode: http.StatusAccepted,
+	}
+
 	tests := []struct {
-		name     string
-		replay   bool // if set, use a MemoryEventStore to enable stream replay
-		tool     func(*testing.T, context.Context, *ServerSession)
-		requests []streamableRequest // http requests
+		name         string
+		replay       bool                                                // if set, use a MemoryEventStore to enable replay
+		tool         func(*testing.T, context.Context, *CallToolRequest) // if set, called during execution
+		requests     []streamableRequest
+		wantSessions int // number of sessions expected after the test
 	}{
 		{
 			name: "basic",
@@ -713,6 +818,19 @@ func TestStreamableServerTransport(t *testing.T) {
 					wantMessages:   []jsonrpc.Message{resp(2, &CallToolResult{Content: []Content{}}, nil)},
 				},
 			},
+			wantSessions: 1,
+		},
+		{
+			name: "uninitialized",
+			requests: []streamableRequest{
+				{
+					method:             "POST",
+					messages:           []jsonrpc.Message{req(2, "tools/call", &CallToolParams{Name: "tool"})},
+					wantStatusCode:     http.StatusOK,
+					wantBodyContaining: "invalid during session initialization",
+				},
+			},
+			wantSessions: 0,
 		},
 		{
 			name: "accept headers",
@@ -747,6 +865,7 @@ func TestStreamableServerTransport(t *testing.T) {
 					wantMessages:   []jsonrpc.Message{resp(4, &CallToolResult{Content: []Content{}}, nil)},
 				},
 			},
+			wantSessions: 1,
 		},
 		{
 			name: "protocol version headers",
@@ -762,6 +881,7 @@ func TestStreamableServerTransport(t *testing.T) {
 					wantSessionID:      false,        // could be true, but shouldn't matter
 				},
 			},
+			wantSessions: 1,
 		},
 		{
 			name: "batch rejected on 2025-06-18",
@@ -781,6 +901,7 @@ func TestStreamableServerTransport(t *testing.T) {
 					wantBodyContaining: "batch",
 				},
 			},
+			wantSessions: 1,
 		},
 		{
 			name: "batch accepted on 2025-03-26",
@@ -803,12 +924,13 @@ func TestStreamableServerTransport(t *testing.T) {
 					},
 				},
 			},
+			wantSessions: 1,
 		},
 		{
 			name: "tool notification",
-			tool: func(t *testing.T, ctx context.Context, ss *ServerSession) {
+			tool: func(t *testing.T, ctx context.Context, req *CallToolRequest) {
 				// Send an arbitrary notification.
-				if err := ss.NotifyProgress(ctx, &ProgressNotificationParams{}); err != nil {
+				if err := req.Session.NotifyProgress(ctx, &ProgressNotificationParams{}); err != nil {
 					t.Errorf("Notify failed: %v", err)
 				}
 			},
@@ -827,12 +949,13 @@ func TestStreamableServerTransport(t *testing.T) {
 					},
 				},
 			},
+			wantSessions: 1,
 		},
 		{
 			name: "tool upcall",
-			tool: func(t *testing.T, ctx context.Context, ss *ServerSession) {
+			tool: func(t *testing.T, ctx context.Context, req *CallToolRequest) {
 				// Make an arbitrary call.
-				if _, err := ss.ListRoots(ctx, &ListRootsParams{}); err != nil {
+				if _, err := req.Session.ListRoots(ctx, &ListRootsParams{}); err != nil {
 					t.Errorf("Call failed: %v", err)
 				}
 			},
@@ -859,26 +982,29 @@ func TestStreamableServerTransport(t *testing.T) {
 					},
 				},
 			},
+			wantSessions: 1,
 		},
 		{
 			name: "background",
 			// Enabling replay is necessary here because the standalone "GET" request
 			// is fully asynronous. Replay is needed to guarantee message delivery.
+			//
+			// TODO(rfindley): this should no longer be necessary.
 			replay: true,
-			tool: func(t *testing.T, _ context.Context, ss *ServerSession) {
+			tool: func(t *testing.T, _ context.Context, req *CallToolRequest) {
 				// Perform operations on a background context, and ensure the client
 				// receives it.
 				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 				defer cancel()
 
-				if err := ss.NotifyProgress(ctx, &ProgressNotificationParams{}); err != nil {
+				if err := req.Session.NotifyProgress(ctx, &ProgressNotificationParams{}); err != nil {
 					t.Errorf("Notify failed: %v", err)
 				}
 				// TODO(rfindley): finish implementing logging.
 				// if err := ss.LoggingMessage(ctx, &LoggingMessageParams{}); err != nil {
 				// 	t.Errorf("Logging failed: %v", err)
 				// }
-				if _, err := ss.ListRoots(ctx, &ListRootsParams{}); err != nil {
+				if _, err := req.Session.ListRoots(ctx, &ListRootsParams{}); err != nil {
 					t.Errorf("ListRoots failed: %v", err)
 				}
 			},
@@ -921,6 +1047,99 @@ func TestStreamableServerTransport(t *testing.T) {
 					headers: map[string][]string{"Accept": nil},
 				},
 			},
+			wantSessions: 0, // session deleted
+		},
+		{
+			name:   "no priming message on old protocol",
+			replay: true,
+			requests: []streamableRequest{
+				initialize,
+				initialized,
+				{
+					method:                "POST",
+					messages:              []jsonrpc.Message{req(2, "tools/call", &CallToolParams{Name: "tool"})},
+					wantStatusCode:        http.StatusOK,
+					wantMessages:          []jsonrpc.Message{resp(2, &CallToolResult{Content: []Content{}}, nil)},
+					wantBodyNotContaining: "prime",
+				},
+			},
+			wantSessions: 1,
+		},
+		{
+			name:   "no close message on old protocol",
+			replay: true,
+			tool: func(t *testing.T, _ context.Context, req *CallToolRequest) {
+				req.Extra.CloseSSEStream(CloseSSEStreamArgs{RetryAfter: time.Millisecond})
+			},
+			requests: []streamableRequest{
+				initialize,
+				initialized,
+				{
+					method:                "POST",
+					messages:              []jsonrpc.Message{req(2, "tools/call", &CallToolParams{Name: "tool"})},
+					wantStatusCode:        http.StatusOK,
+					wantMessages:          []jsonrpc.Message{resp(2, &CallToolResult{Content: []Content{}}, nil)},
+					wantBodyNotContaining: "close",
+				},
+			},
+			wantSessions: 1,
+		},
+		{
+			name:   "priming message on 2025-11-25",
+			replay: true,
+			requests: []streamableRequest{
+				initialize20251125,
+				initialized20251125,
+				{
+					method:             "POST",
+					headers:            http.Header{protocolVersionHeader: {protocolVersion20251125}},
+					messages:           []jsonrpc.Message{req(2, "tools/call", &CallToolParams{Name: "tool"})},
+					wantStatusCode:     http.StatusOK,
+					wantMessages:       []jsonrpc.Message{resp(2, &CallToolResult{Content: []Content{}}, nil)},
+					wantBodyContaining: "prime",
+				},
+			},
+			wantSessions: 1,
+		},
+		{
+			name:   "close message on 2025-11-25",
+			replay: true,
+			tool: func(t *testing.T, _ context.Context, req *CallToolRequest) {
+				req.Extra.CloseSSEStream(CloseSSEStreamArgs{RetryAfter: time.Millisecond})
+			},
+			requests: []streamableRequest{
+				initialize20251125,
+				initialized20251125,
+				{
+					method:                "POST",
+					headers:               http.Header{protocolVersionHeader: {protocolVersion20251125}},
+					messages:              []jsonrpc.Message{req(2, "tools/call", &CallToolParams{Name: "tool"})},
+					wantStatusCode:        http.StatusOK,
+					wantMessages:          []jsonrpc.Message{resp(2, &CallToolResult{Content: []Content{}}, nil)},
+					wantBodyContaining:    "close",
+					wantBodyNotContaining: "result",
+				},
+			},
+			wantSessions: 1,
+		},
+		{
+			name:   "no close message",
+			replay: true,
+			tool: func(t *testing.T, _ context.Context, req *CallToolRequest) {
+				req.Extra.CloseSSEStream(CloseSSEStreamArgs{})
+			},
+			requests: []streamableRequest{
+				initialize,
+				initialized,
+				{
+					method:                "POST",
+					messages:              []jsonrpc.Message{req(2, "tools/call", &CallToolParams{Name: "tool"})},
+					wantStatusCode:        http.StatusOK,
+					wantMessages:          []jsonrpc.Message{resp(2, &CallToolResult{Content: []Content{}}, nil)},
+					wantBodyNotContaining: "close",
+				},
+			},
+			wantSessions: 1,
 		},
 		{
 			name: "errors",
@@ -947,11 +1166,12 @@ func TestStreamableServerTransport(t *testing.T) {
 					method:         "POST",
 					messages:       []jsonrpc.Message{req(2, "tools/call", &CallToolParams{Name: "tool"})},
 					wantStatusCode: http.StatusOK,
-					wantMessages: []jsonrpc.Message{resp(2, nil, &jsonrpc2.WireError{
+					wantMessages: []jsonrpc.Message{resp(2, nil, &jsonrpc.Error{
 						Message: `method "tools/call" is invalid during session initialization`,
 					})},
 				},
 			},
+			wantSessions: 0,
 		},
 	}
 
@@ -964,7 +1184,7 @@ func TestStreamableServerTransport(t *testing.T) {
 				&Tool{Name: "tool", InputSchema: &jsonschema.Schema{Type: "object"}},
 				func(ctx context.Context, req *CallToolRequest) (*CallToolResult, error) {
 					if test.tool != nil {
-						test.tool(t, ctx, req.Session)
+						test.tool(t, ctx, req)
 					}
 					return &CallToolResult{}, nil
 				})
@@ -978,6 +1198,9 @@ func TestStreamableServerTransport(t *testing.T) {
 			defer handler.closeAll()
 
 			testStreamableHandler(t, handler, test.requests)
+			if got := len(slices.Collect(server.Sessions())); got != test.wantSessions {
+				t.Errorf("after test, got %d sessions, want %d", got, test.wantSessions)
+			}
 		})
 	}
 }
@@ -1073,10 +1296,13 @@ func testStreamableHandler(t *testing.T, handler http.Handler, requests []stream
 		}
 		wg.Wait()
 
-		if request.wantBodyContaining != "" {
+		if request.wantBodyContaining != "" || request.wantBodyNotContaining != "" {
 			body := string(gotBody)
-			if !strings.Contains(body, request.wantBodyContaining) {
+			if request.wantBodyContaining != "" && !strings.Contains(body, request.wantBodyContaining) {
 				t.Errorf("body does not contain %q:\n%s", request.wantBodyContaining, body)
+			}
+			if request.wantBodyNotContaining != "" && strings.Contains(body, request.wantBodyNotContaining) {
+				t.Errorf("body contains %q:\n%s", request.wantBodyNotContaining, body)
 			}
 		} else {
 			transform := cmpopts.AcyclicTransformer("jsonrpcid", func(id jsonrpc.ID) any { return id.Raw() })
@@ -1129,11 +1355,12 @@ type streamableRequest struct {
 	headers  http.Header       // additional headers to set, overlaid on top of the default headers
 	messages []jsonrpc.Message // messages to send
 
-	closeAfter         int               // if nonzero, close after receiving this many messages
-	wantStatusCode     int               // expected status code
-	wantBodyContaining string            // if set, expect the response body to contain this text; overrides wantMessages
-	wantMessages       []jsonrpc.Message // expected messages to receive; ignored if wantBodyContaining is set
-	wantSessionID      bool              // whether or not a session ID is expected in the response
+	closeAfter            int               // if nonzero, close after receiving this many messages
+	wantStatusCode        int               // expected status code
+	wantBodyContaining    string            // if set, expect the response body to contain this text; overrides wantMessages
+	wantBodyNotContaining string            // if set, a negative assertion on the body; overrides wantMessages
+	wantMessages          []jsonrpc.Message // expected messages to receive; ignored if wantBodyContaining is set
+	wantSessionID         bool              // whether or not a session ID is expected in the response
 }
 
 // streamingRequest makes a request to the given streamable server with the
@@ -1202,13 +1429,15 @@ func (s streamableRequest) do(ctx context.Context, serverURL, sessionID string, 
 			if err != nil {
 				return newSessionID, resp.StatusCode, nil, fmt.Errorf("reading events: %v", err)
 			}
-			// TODO(rfindley): do we need to check evt.name?
-			// Does the MCP spec say anything about this?
-			msg, err := jsonrpc2.DecodeMessage(evt.Data)
-			if err != nil {
-				return newSessionID, resp.StatusCode, nil, fmt.Errorf("decoding message: %w", err)
+			if evt.Name == "" || evt.Name == "message" { // ordinary message
+				// TODO(rfindley): do we need to check evt.name?
+				// Does the MCP spec say anything about this?
+				msg, err := jsonrpc2.DecodeMessage(evt.Data)
+				if err != nil {
+					return newSessionID, resp.StatusCode, nil, fmt.Errorf("decoding message: %w", err)
+				}
+				out <- msg
 			}
-			out <- msg
 		}
 		respBody = r.w.Bytes()
 	} else if strings.HasPrefix(contentType, "application/json") {
@@ -1481,8 +1710,84 @@ func TestTokenInfo(t *testing.T) {
 	if !ok {
 		t.Fatal("not TextContent")
 	}
-	if g, w := tc.Text, "&{[scope] 5000-01-02 03:04:05 +0000 UTC map[]}"; g != w {
+	if g, w := tc.Text, "&{[scope] 5000-01-02 03:04:05 +0000 UTC  map[]}"; g != w {
 		t.Errorf("got %q, want %q", g, w)
+	}
+}
+
+func TestSessionHijackingPrevention(t *testing.T) {
+	// This test verifies that sessions bound to a user ID cannot be accessed
+	// by a different user (session hijacking prevention).
+	ctx := context.Background()
+
+	server := NewServer(testImpl, nil)
+	streamHandler := NewStreamableHTTPHandler(func(req *http.Request) *Server { return server }, nil)
+
+	// Use the bearer token directly as the user ID. This simulates how a real
+	// verifier might extract a user ID from a JWT "sub" claim or introspection.
+	verifier := func(_ context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
+		return &auth.TokenInfo{
+			Scopes:     []string{"scope"},
+			UserID:     token,
+			Expiration: time.Date(5000, 1, 2, 3, 4, 5, 0, time.UTC),
+		}, nil
+	}
+	handler := auth.RequireBearerToken(verifier, nil)(streamHandler)
+	httpServer := httptest.NewServer(mustNotPanic(t, handler))
+	defer httpServer.Close()
+
+	// Helper to send a JSON-RPC request as a given user.
+	doRequest := func(msg jsonrpc.Message, sessionID, userID string) *http.Response {
+		t.Helper()
+		data, _ := jsonrpc2.EncodeMessage(msg)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, httpServer.URL, bytes.NewReader(data))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("Authorization", "Bearer "+userID)
+		if sessionID != "" {
+			req.Header.Set("Mcp-Session-Id", sessionID)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		return resp
+	}
+
+	// Create a session as user1.
+	initReq := &jsonrpc.Request{Method: "initialize", ID: jsonrpc2.Int64ID(1)}
+	initReq.Params, _ = json.Marshal(&InitializeParams{
+		ProtocolVersion: protocolVersion20250618,
+		ClientInfo:      &Implementation{Name: "test", Version: "1.0"},
+	})
+	resp := doRequest(initReq, "", "user1")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("initialize failed with status %d: %s", resp.StatusCode, body)
+	}
+	sessionID := resp.Header.Get("Mcp-Session-Id")
+	if sessionID == "" {
+		t.Fatal("no session ID in response")
+	}
+
+	pingReq := &jsonrpc.Request{Method: "ping", ID: jsonrpc2.Int64ID(2)}
+	pingReq.Params, _ = json.Marshal(&PingParams{})
+
+	// Try to access the session as user2 - should fail.
+	resp2 := doRequest(pingReq, sessionID, "user2")
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Errorf("expected status %d for user mismatch, got %d: %s", http.StatusForbidden, resp2.StatusCode, body)
+	}
+
+	// Access as original user1 should succeed.
+	resp3 := doRequest(pingReq, sessionID, "user1")
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp3.Body)
+		t.Errorf("expected status %d for matching user, got %d: %s", http.StatusOK, resp3.StatusCode, body)
 	}
 }
 
@@ -1524,7 +1829,9 @@ func TestStreamableGET(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := resp.StatusCode, http.StatusMethodNotAllowed; got != want {
+	// GET without session should return 400 Bad Request (not 405) because
+	// GET is a valid method - it just requires a session ID.
+	if got, want := resp.StatusCode, http.StatusBadRequest; got != want {
 		t.Errorf("initial GET: got status %d, want %d", got, want)
 	}
 	defer resp.Body.Close()
@@ -1569,6 +1876,101 @@ func TestStreamableGET(t *testing.T) {
 	defer resp.Body.Close()
 	if got, want := resp.StatusCode, http.StatusNoContent; got != want {
 		t.Errorf("DELETE with session ID: got status %d, want %d", got, want)
+	}
+}
+
+// TestStreamable405AllowHeader verifies RFC 9110 §15.5.6 compliance:
+// 405 Method Not Allowed responses MUST include an Allow header.
+func TestStreamable405AllowHeader(t *testing.T) {
+	server := NewServer(testImpl, nil)
+
+	tests := []struct {
+		name       string
+		stateless  bool
+		method     string
+		wantStatus int
+		wantAllow  string
+	}{
+		{
+			name:       "unsupported method stateful",
+			stateless:  false,
+			method:     "PUT",
+			wantStatus: http.StatusMethodNotAllowed,
+			wantAllow:  "GET, POST, DELETE",
+		},
+		{
+			name:       "GET in stateless mode",
+			stateless:  true,
+			method:     "GET",
+			wantStatus: http.StatusMethodNotAllowed,
+			wantAllow:  "POST",
+		},
+		{
+			// DELETE without session returns 400 Bad Request (not 405)
+			// because DELETE is a valid method, just requires a session ID.
+			name:       "DELETE without session stateless",
+			stateless:  true,
+			method:     "DELETE",
+			wantStatus: http.StatusBadRequest,
+			wantAllow:  "", // No Allow header for 400 responses
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &StreamableHTTPOptions{Stateless: tt.stateless}
+			handler := NewStreamableHTTPHandler(func(req *http.Request) *Server { return server }, opts)
+			httpServer := httptest.NewServer(mustNotPanic(t, handler))
+			defer httpServer.Close()
+
+			req, err := http.NewRequest(tt.method, httpServer.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Accept", "application/json, text/event-stream")
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if got := resp.StatusCode; got != tt.wantStatus {
+				t.Errorf("status code: got %d, want %d", got, tt.wantStatus)
+			}
+
+			allow := resp.Header.Get("Allow")
+			if allow != tt.wantAllow {
+				t.Errorf("Allow header: got %q, want %q", allow, tt.wantAllow)
+			}
+		})
+	}
+}
+
+// TestStreamableGETWithoutSession verifies that GET without session ID in stateful mode
+// returns 400 Bad Request (not 405), since GET is a supported method that requires a session.
+func TestStreamableGETWithoutSession(t *testing.T) {
+	server := NewServer(testImpl, nil)
+	handler := NewStreamableHTTPHandler(func(req *http.Request) *Server { return server }, nil)
+	httpServer := httptest.NewServer(mustNotPanic(t, handler))
+	defer httpServer.Close()
+
+	req, err := http.NewRequest("GET", httpServer.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// GET without session should return 400 Bad Request, not 405 Method Not Allowed,
+	// because GET is a valid method - it just requires a session ID.
+	if got, want := resp.StatusCode, http.StatusBadRequest; got != want {
+		t.Errorf("status code: got %d, want %d", got, want)
 	}
 }
 
@@ -1620,10 +2022,96 @@ func TestStreamableClientContextPropagation(t *testing.T) {
 	cancel()
 	select {
 	case <-streamableConn.ctx.Done():
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Connection context was not cancelled when parent was cancelled")
+		t.Errorf("cancelling the connection context after successful connection broke the connection")
+	default:
+	}
+}
+
+func TestStreamableSessionTimeout(t *testing.T) {
+	// TODO: this test relies on timing and may be flaky.
+	// Fixing with testing/synctest is challenging because it uses real I/O (via
+	// httptest.NewServer).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server := NewServer(testImpl, nil)
+
+	deleted := make(chan string, 1)
+	handler := NewStreamableHTTPHandler(
+		func(req *http.Request) *Server { return server },
+		&StreamableHTTPOptions{
+			SessionTimeout: 50 * time.Millisecond,
+		},
+	)
+	handler.onTransportDeletion = func(sessionID string) {
+		deleted <- sessionID
 	}
 
+	httpServer := httptest.NewServer(mustNotPanic(t, handler))
+	defer httpServer.Close()
+
+	// Connect a client to create a session.
+	client := NewClient(testImpl, nil)
+	session, err := client.Connect(ctx, &StreamableClientTransport{Endpoint: httpServer.URL}, nil)
+	if err != nil {
+		t.Fatalf("client.Connect() failed: %v", err)
+	}
+	defer session.Close()
+
+	sessionID := session.ID()
+	if sessionID == "" {
+		t.Fatal("client session has empty ID")
+	}
+
+	// Verify the session exists on the server.
+	serverSessions := slices.Collect(server.Sessions())
+	if len(serverSessions) != 1 {
+		t.Fatalf("got %d sessions, want 1", len(serverSessions))
+	}
+	if got := serverSessions[0].ID(); got != sessionID {
+		t.Fatalf("server session is %q, want %q", got, sessionID)
+	}
+
+	// Test that (possibly concurrent) requests keep the session alive.
+	//
+	// Spin up two goroutines, each making a request every 10ms. These requests
+	// should keep the server from timing out.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for range 2 {
+		go func() {
+			defer wg.Done()
+
+			for range 20 {
+				if _, err := session.ListTools(ctx, nil); err != nil {
+					t.Errorf("ListTools failed: %v", err)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Wait for the session to be cleaned up.
+	select {
+	case deletedID := <-deleted:
+		if deletedID != sessionID {
+			t.Errorf("deleted session ID = %q, want %q", deletedID, sessionID)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for session cleanup")
+	}
+
+	// Verify the session is gone from both handler and server.
+	handler.mu.Lock()
+	if len(handler.sessions) != 0 {
+		t.Errorf("handler.sessions is not empty; length %d", len(handler.sessions))
+	}
+	if ss := slices.Collect(server.Sessions()); len(ss) != 0 {
+		t.Errorf("server.Sessions() is not empty; length %d", len(ss))
+	}
+	handler.mu.Unlock()
 }
 
 // mustNotPanic is a helper to enforce that test handlers do not panic (see
@@ -1640,4 +2128,360 @@ func mustNotPanic(t *testing.T, h http.Handler) http.Handler {
 		}()
 		h.ServeHTTP(w, req)
 	})
+}
+
+// TestPingEventFiltering verifies that the streamable client correctly filters
+// out SSE "ping" events, which are used for keep-alive but should not be
+// treated as JSON-RPC messages.
+//
+// This test addresses issue #636: the client should skip non-"message" events
+// according to the SSE specification. It tests the fix in processStream where
+// events with evt.Name != "" && evt.Name != "message" are skipped.
+func TestPingEventFiltering(t *testing.T) {
+	// This test verifies the low-level processStream filtering.
+	// We create a mock response with ping and message events.
+
+	sseData := `event: ping
+data: ping
+
+event: message
+id: 1
+data: {"jsonrpc":"2.0","id":1,"result":{}}
+
+event: ping
+data: keepalive
+
+`
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader([]byte(sseData))),
+	}
+
+	// Create a minimal streamableClientConn for testing
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	incoming := make(chan jsonrpc.Message, 10)
+	done := make(chan struct{})
+
+	conn := &streamableClientConn{
+		ctx:      ctx,
+		done:     done,
+		incoming: incoming,
+	}
+
+	// Create a test request
+	testReq := &jsonrpc.Request{
+		ID:     jsonrpc2.Int64ID(1),
+		Method: "test",
+	}
+
+	// Process the stream
+	go conn.processStream(ctx, "test", resp, testReq)
+
+	// Collect messages with timeout
+	var messages []jsonrpc.Message
+	timeout := time.After(1 * time.Second)
+
+collectLoop:
+	for {
+		select {
+		case msg := <-incoming:
+			messages = append(messages, msg)
+			// We expect only 1 message (the response), not the ping events
+			if len(messages) >= 1 {
+				break collectLoop
+			}
+		case <-timeout:
+			break collectLoop
+		}
+	}
+
+	// Verify we only received the actual message, not the ping events
+	if len(messages) != 1 {
+		t.Errorf("got %d messages, want 1 (ping events should be filtered)", len(messages))
+		for i, msg := range messages {
+			t.Logf("message %d: %T", i, msg)
+		}
+	}
+
+	// Verify the message is the response
+	if len(messages) > 0 {
+		resp, ok := messages[0].(*jsonrpc.Response)
+		if !ok {
+			t.Errorf("first message is %T, want *jsonrpc.Response", messages[0])
+		} else if resp.ID.Raw() != int64(1) {
+			t.Errorf("response ID is %v, want 1", resp.ID.Raw())
+		}
+	}
+}
+
+// TestProcessStreamPrimingEvent verifies that the streamable client correctly ignores
+// SSE events with empty data buffers, which are used as priming events (e.g. SEP-1699).
+func TestProcessStreamPrimingEvent(t *testing.T) {
+	// We create a mock response with a priming event (empty data, with an ID),
+	// followed by a normal event.
+	sseData := `id: 123
+
+id: 124
+data: {"jsonrpc":"2.0","id":1,"result":{}}
+
+`
+
+	ctx := t.Context()
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(sseData)),
+	}
+
+	incoming := make(chan jsonrpc.Message, 10)
+	done := make(chan struct{})
+
+	conn := &streamableClientConn{
+		ctx:      ctx,
+		done:     done,
+		incoming: incoming,
+		failed:   make(chan struct{}),
+		logger:   ensureLogger(nil),
+	}
+
+	lastID, _, clientClosed := conn.processStream(ctx, "test", resp, nil)
+
+	if clientClosed {
+		t.Fatalf("processStream was unexpectedly closed by client")
+	}
+
+	if lastID != "124" {
+		t.Errorf("lastEventID = %q, want %q", lastID, "124")
+	}
+
+	select {
+	case msg := <-incoming:
+		if res, ok := msg.(*jsonrpc.Response); !(ok && res.ID == jsonrpc2.Int64ID(1)) {
+			t.Errorf("got unexpected message: %v", msg)
+		}
+	default:
+		t.Errorf("expected a JSON-RPC message to be produced")
+	}
+}
+
+// TestScanEventsPingFiltering is a unit test for the low-level event scanning
+// with ping events to verify scanEvents properly parses all event types.
+func TestScanEventsPingFiltering(t *testing.T) {
+	// Create SSE stream with mixed events
+	sseData := `event: ping
+data: ping
+
+event: message
+data: {"jsonrpc":"2.0","method":"test","params":{}}
+
+event: ping
+data: keepalive
+
+event: message
+data: {"jsonrpc":"2.0","method":"test2","params":{}}
+
+`
+
+	reader := strings.NewReader(sseData)
+	var events []Event
+
+	// Scan all events
+	for evt, err := range scanEvents(reader) {
+		if err != nil {
+			if err != io.EOF {
+				t.Fatalf("scanEvents error: %v", err)
+			}
+			break
+		}
+		events = append(events, evt)
+	}
+
+	// Verify we got all 4 events
+	if len(events) != 4 {
+		t.Fatalf("got %d events, want 4", len(events))
+	}
+
+	// Verify event types
+	expectedNames := []string{"ping", "message", "ping", "message"}
+	for i, evt := range events {
+		if evt.Name != expectedNames[i] {
+			t.Errorf("event %d: got name %q, want %q", i, evt.Name, expectedNames[i])
+		}
+	}
+
+	// Verify that we can decode the message events but would fail on ping events
+	for i, evt := range events {
+		switch evt.Name {
+		case "message":
+			_, err := jsonrpc.DecodeMessage(evt.Data)
+			if err != nil {
+				t.Errorf("event %d: failed to decode message event: %v", i, err)
+			}
+		case "ping":
+			// Ping events have non-JSON data and should fail decoding
+			_, err := jsonrpc.DecodeMessage(evt.Data)
+			if err == nil {
+				t.Errorf("event %d: ping event unexpectedly decoded as valid JSON-RPC", i)
+			}
+		}
+	}
+}
+
+func Test_ExportErrSessionMissing(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Setup server
+	impl := &Implementation{Name: "test", Version: "1.0.0"}
+	server := NewServer(impl, nil)
+	handler := NewStreamableHTTPHandler(func(r *http.Request) *Server { return server }, nil)
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	// 2. Setup client
+	clientTransport := &StreamableClientTransport{
+		Endpoint: ts.URL,
+	}
+	client := NewClient(impl, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer session.Close()
+
+	// 3. Manually invalidate session on server
+	handler.mu.Lock()
+	if len(handler.sessions) != 1 {
+		handler.mu.Unlock()
+		t.Fatalf("expected 1 session, got %d", len(handler.sessions))
+	}
+	for id := range handler.sessions {
+		delete(handler.sessions, id)
+	}
+	handler.mu.Unlock()
+
+	// 4. Try to call a tool (or any request)
+	_, err = session.ListTools(ctx, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// 5. Verify it's ErrSessionMissing
+	if !errors.Is(err, ErrSessionMissing) {
+		t.Errorf("expected error to wrap ErrSessionMissing, got: %v", err)
+	}
+}
+
+// TestStreamableLocalhostProtection verifies that DNS rebinding protection
+// is automatically enabled for localhost servers.
+func TestStreamableLocalhostProtection(t *testing.T) {
+	server := NewServer(testImpl, nil)
+
+	tests := []struct {
+		name              string
+		listenAddr        string // Address to listen on
+		hostHeader        string // Host header in request
+		disableProtection bool   // DisableLocalhostProtection setting
+		wantStatus        int
+	}{
+		// Auto-enabled for localhost listeners (127.0.0.1).
+		{
+			name:              "127.0.0.1 accepts 127.0.0.1",
+			listenAddr:        "127.0.0.1:0",
+			hostHeader:        "127.0.0.1:1234",
+			disableProtection: false,
+			wantStatus:        http.StatusOK,
+		},
+		{
+			name:              "127.0.0.1 accepts localhost",
+			listenAddr:        "127.0.0.1:0",
+			hostHeader:        "localhost:1234",
+			disableProtection: false,
+			wantStatus:        http.StatusOK,
+		},
+		{
+			name:              "127.0.0.1 rejects evil.com",
+			listenAddr:        "127.0.0.1:0",
+			hostHeader:        "evil.com",
+			disableProtection: false,
+			wantStatus:        http.StatusForbidden,
+		},
+		{
+			name:              "127.0.0.1 rejects evil.com:80",
+			listenAddr:        "127.0.0.1:0",
+			hostHeader:        "evil.com:80",
+			disableProtection: false,
+			wantStatus:        http.StatusForbidden,
+		},
+		{
+			name:              "127.0.0.1 rejects localhost.evil.com",
+			listenAddr:        "127.0.0.1:0",
+			hostHeader:        "localhost.evil.com",
+			disableProtection: false,
+			wantStatus:        http.StatusForbidden,
+		},
+
+		// When listening on 0.0.0.0, requests arriving via localhost are still protected
+		// because LocalAddrContextKey returns the actual connection's local address.
+		// This is actually more secure - DNS rebinding attacks target localhost regardless
+		// of the listener configuration.
+		{
+			name:              "0.0.0.0 via localhost rejects evil.com",
+			listenAddr:        "0.0.0.0:0",
+			hostHeader:        "evil.com",
+			disableProtection: false,
+			wantStatus:        http.StatusForbidden,
+		},
+
+		// Explicit disable
+		{
+			name:              "disabled accepts evil.com",
+			listenAddr:        "127.0.0.1:0",
+			hostHeader:        "evil.com",
+			disableProtection: true,
+			wantStatus:        http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &StreamableHTTPOptions{
+				Stateless:                  true, // Simpler for testing
+				DisableLocalhostProtection: tt.disableProtection,
+			}
+			handler := NewStreamableHTTPHandler(func(req *http.Request) *Server { return server }, opts)
+
+			listener, err := net.Listen("tcp", tt.listenAddr)
+			if err != nil {
+				t.Fatalf("Failed to listen on %s: %v", tt.listenAddr, err)
+			}
+			defer listener.Close()
+
+			srv := &http.Server{Handler: handler}
+			go srv.Serve(listener)
+			defer srv.Close()
+
+			reqReader := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`)
+			req, err := http.NewRequest("POST", fmt.Sprintf("http://%s", listener.Addr().String()), reqReader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Host = tt.hostHeader
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json, text/event-stream")
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if got := resp.StatusCode; got != tt.wantStatus {
+				t.Errorf("Status code: got %d, want %d", got, tt.wantStatus)
+			}
+		})
+	}
 }

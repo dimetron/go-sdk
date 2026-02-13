@@ -20,12 +20,15 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
 )
 
 // This example demonstrates how to integrate auth.RequireBearerToken middleware
 // with an MCP server to provide authenticated access to MCP tools and resources.
 
-var httpAddr = flag.String("http", ":8080", "HTTP address to listen on")
+// Default to loopback to avoid exposing powerful demo endpoints to the local network.
+// Set -http 0.0.0.0:8080 to intentionally expose it.
+var httpAddr = flag.String("http", "localhost:8080", "HTTP address to listen on")
 
 // JWTClaims represents the claims in our JWT tokens.
 // In a real application, you would include additional claims like issuer, audience, etc.
@@ -237,7 +240,8 @@ func main() {
 
 	// Create authentication middleware.
 	jwtAuth := auth.RequireBearerToken(verifyJWT, &auth.RequireBearerTokenOptions{
-		Scopes: []string{"read"}, // Require "read" permission
+		Scopes:              []string{"read"}, // Require "read" permission
+		ResourceMetadataURL: "http://localhost:8080/.well-known/oauth-protected-resource",
 	})
 
 	apiKeyAuth := auth.RequireBearerToken(verifyAPIKey, &auth.RequireBearerTokenOptions{
@@ -340,22 +344,36 @@ func main() {
 		})
 	})
 
+	// OAuth protected resource metadata endpoint.
+	// This endpoint provides OAuth configuration information to clients.
+	// CORS is enabled by default to support cross-origin client discovery.
+	metadata := &oauthex.ProtectedResourceMetadata{
+		Resource: "http://localhost:8080/mcp/jwt",
+		AuthorizationServers: []string{
+			"https://auth.example.com/.well-known/openid-configuration",
+		},
+		ScopesSupported: []string{"read", "write"},
+	}
+	http.Handle("/.well-known/oauth-protected-resource",
+		auth.ProtectedResourceMetadataHandler(metadata))
+
 	// Start the HTTP server.
 	log.Println("Authenticated MCP Server")
 	log.Println("========================")
 	log.Println("Server starting on", *httpAddr)
 	log.Println()
 	log.Println("Available endpoints:")
-	log.Println("  GET  /health                    - Health check (no auth)")
-	log.Println("  GET  /generate-token            - Generate JWT token")
-	log.Println("  POST /generate-api-key          - Generate API key")
-	log.Println("  POST /mcp/jwt                   - MCP endpoint (JWT auth)")
-	log.Println("  POST /mcp/apikey                - MCP endpoint (API key auth)")
+	log.Println("  GET  /health                                    - Health check (no auth)")
+	log.Println("  GET  /.well-known/oauth-protected-resource      - OAuth resource metadata")
+	log.Println("  GET  /generate-token                            - Generate JWT token")
+	log.Println("  POST /generate-api-key                          - Generate API key")
+	log.Println("  POST /mcp/jwt                                   - MCP endpoint (JWT auth)")
+	log.Println("  POST /mcp/apikey                                - MCP endpoint (API key auth)")
 	log.Println()
 	log.Println("Available MCP Tools:")
-	log.Println("  - say_hi                        - Simple greeting (any auth)")
-	log.Println("  - get_user_info                 - Get user info (read scope)")
-	log.Println("  - create_resource               - Create resource (write scope)")
+	log.Println("  - say_hi                                        - Simple greeting (any auth)")
+	log.Println("  - get_user_info                                 - Get user info (read scope)")
+	log.Println("  - create_resource                               - Create resource (write scope)")
 	log.Println()
 	log.Println("Example usage:")
 	log.Println("  # Generate a token")

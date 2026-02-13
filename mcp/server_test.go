@@ -5,9 +5,11 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/internal/jsonrpc2"
 )
 
 type testItem struct {
@@ -242,14 +245,14 @@ func TestServerCapabilities(t *testing.T) {
 		wantCapabilities *ServerCapabilities
 	}{
 		{
-			name:            "No capabilities",
+			name:            "no capabilities",
 			configureServer: func(s *Server) {},
 			wantCapabilities: &ServerCapabilities{
 				Logging: &LoggingCapabilities{},
 			},
 		},
 		{
-			name: "With prompts",
+			name: "with prompts",
 			configureServer: func(s *Server) {
 				s.AddPrompt(&Prompt{Name: "p"}, nil)
 			},
@@ -259,7 +262,7 @@ func TestServerCapabilities(t *testing.T) {
 			},
 		},
 		{
-			name: "With resources",
+			name: "with resources",
 			configureServer: func(s *Server) {
 				s.AddResource(&Resource{URI: "file:///r"}, nil)
 			},
@@ -269,7 +272,7 @@ func TestServerCapabilities(t *testing.T) {
 			},
 		},
 		{
-			name: "With resource templates",
+			name: "with resource templates",
 			configureServer: func(s *Server) {
 				s.AddResourceTemplate(&ResourceTemplate{URITemplate: "file:///rt"}, nil)
 			},
@@ -279,7 +282,7 @@ func TestServerCapabilities(t *testing.T) {
 			},
 		},
 		{
-			name: "With resource subscriptions",
+			name: "with resource subscriptions",
 			configureServer: func(s *Server) {
 				s.AddResourceTemplate(&ResourceTemplate{URITemplate: "file:///rt"}, nil)
 			},
@@ -297,7 +300,7 @@ func TestServerCapabilities(t *testing.T) {
 			},
 		},
 		{
-			name: "With tools",
+			name: "with tools",
 			configureServer: func(s *Server) {
 				s.AddTool(tool, nil)
 			},
@@ -307,7 +310,7 @@ func TestServerCapabilities(t *testing.T) {
 			},
 		},
 		{
-			name:            "With completions",
+			name:            "with completions",
 			configureServer: func(s *Server) {},
 			serverOpts: ServerOptions{
 				CompletionHandler: func(context.Context, *CompleteRequest) (*CompleteResult, error) {
@@ -320,7 +323,7 @@ func TestServerCapabilities(t *testing.T) {
 			},
 		},
 		{
-			name: "With all capabilities",
+			name: "all capabilities",
 			configureServer: func(s *Server) {
 				s.AddPrompt(&Prompt{Name: "p"}, nil)
 				s.AddResource(&Resource{URI: "file:///r"}, nil)
@@ -347,7 +350,7 @@ func TestServerCapabilities(t *testing.T) {
 			},
 		},
 		{
-			name:            "With initial capabilities",
+			name:            "has features",
 			configureServer: func(s *Server) {},
 			serverOpts: ServerOptions{
 				HasPrompts:   true,
@@ -359,6 +362,83 @@ func TestServerCapabilities(t *testing.T) {
 				Prompts:   &PromptCapabilities{ListChanged: true},
 				Resources: &ResourceCapabilities{ListChanged: true},
 				Tools:     &ToolCapabilities{ListChanged: true},
+			},
+		},
+		{
+			name:            "empty capabilities",
+			configureServer: func(s *Server) {},
+			serverOpts: ServerOptions{
+				Capabilities: &ServerCapabilities{},
+			},
+			wantCapabilities: &ServerCapabilities{},
+		},
+		{
+			name:            "no logging",
+			configureServer: func(s *Server) {},
+			serverOpts: ServerOptions{
+				Capabilities: &ServerCapabilities{
+					Tools: &ToolCapabilities{ListChanged: true},
+				},
+			},
+			wantCapabilities: &ServerCapabilities{
+				Tools: &ToolCapabilities{ListChanged: true},
+			},
+		},
+		{
+			name:            "no list",
+			configureServer: func(s *Server) {},
+			serverOpts: ServerOptions{
+				Capabilities: &ServerCapabilities{
+					Tools:   &ToolCapabilities{ListChanged: false},
+					Prompts: &PromptCapabilities{ListChanged: false},
+				},
+			},
+			wantCapabilities: &ServerCapabilities{
+				Tools:   &ToolCapabilities{ListChanged: false},
+				Prompts: &PromptCapabilities{ListChanged: false},
+			},
+		},
+		{
+			name: "adding tools-list",
+			configureServer: func(s *Server) {
+				s.AddTool(tool, nil)
+			},
+			serverOpts: ServerOptions{
+				Capabilities: &ServerCapabilities{
+					Logging: &LoggingCapabilities{},
+				},
+			},
+			wantCapabilities: &ServerCapabilities{
+				Logging: &LoggingCapabilities{},
+				Tools:   &ToolCapabilities{ListChanged: true},
+			},
+		},
+		{
+			name: "adding tools-no list",
+			configureServer: func(s *Server) {
+				s.AddTool(tool, nil)
+			},
+			serverOpts: ServerOptions{
+				Capabilities: &ServerCapabilities{
+					Tools: &ToolCapabilities{ListChanged: false},
+				},
+			},
+			wantCapabilities: &ServerCapabilities{
+				Tools: &ToolCapabilities{ListChanged: false},
+			},
+		},
+		{
+			name:            "experimental preserved",
+			configureServer: func(s *Server) {},
+			serverOpts: ServerOptions{
+				Capabilities: &ServerCapabilities{
+					Experimental: map[string]any{"custom": "value"},
+					Logging:      &LoggingCapabilities{},
+				},
+			},
+			wantCapabilities: &ServerCapabilities{
+				Experimental: map[string]any{"custom": "value"},
+				Logging:      &LoggingCapabilities{},
 			},
 		},
 	}
@@ -490,6 +570,69 @@ func TestAddTool(t *testing.T) {
 	}
 }
 
+func TestAddToolNameValidation(t *testing.T) {
+	tests := []struct {
+		label             string
+		name              string
+		wantLogContaining string
+	}{
+		{
+			label:             "empty name",
+			name:              "",
+			wantLogContaining: `tool name cannot be empty`,
+		},
+		{
+			label:             "long name",
+			name:              strings.Repeat("a", 129),
+			wantLogContaining: "exceeds maximum length of 128 characters",
+		},
+		{
+			label:             "name with spaces",
+			name:              "get user profile",
+			wantLogContaining: `tool name contains invalid characters: \" \"`,
+		},
+		{
+			label:             "name with multiple invalid chars",
+			name:              "user name@domain,com",
+			wantLogContaining: `tool name contains invalid characters: \" \", \"@\", \",\"`,
+		},
+		{
+			label:             "name with unicode",
+			name:              "tool-ñame",
+			wantLogContaining: `tool name contains invalid characters: \"ñ\"`,
+		},
+		{
+			label:             "valid name",
+			name:              "valid-tool_name.123",
+			wantLogContaining: "", // No log expected
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.label, func(t *testing.T) {
+			var buf bytes.Buffer
+			s := NewServer(testImpl, &ServerOptions{
+				Logger: slog.New(slog.NewTextHandler(&buf, nil)),
+			})
+
+			// Use the generic AddTool as it also calls validateToolName.
+			AddTool(s, &Tool{Name: test.name}, func(context.Context, *CallToolRequest, any) (*CallToolResult, any, error) {
+				return nil, nil, nil
+			})
+
+			logOutput := buf.String()
+			if test.wantLogContaining != "" {
+				if !strings.Contains(logOutput, test.wantLogContaining) {
+					t.Errorf("log output =\n%s\nwant containing %q", logOutput, test.wantLogContaining)
+				}
+			} else {
+				if logOutput != "" {
+					t.Errorf("expected empty log output, got %q", logOutput)
+				}
+			}
+		})
+	}
+}
+
 type schema = jsonschema.Schema
 
 func testToolForSchema[In, Out any](t *testing.T, tool *Tool, in string, out Out, wantIn, wantOut any, wantErrContaining string) {
@@ -497,7 +640,7 @@ func testToolForSchema[In, Out any](t *testing.T, tool *Tool, in string, out Out
 	th := func(context.Context, *CallToolRequest, In) (*CallToolResult, Out, error) {
 		return nil, out, nil
 	}
-	gott, goth, err := toolForErr(tool, th)
+	gott, goth, err := toolForErr(tool, th, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -535,6 +678,128 @@ func testToolForSchema[In, Out any](t *testing.T, tool *Tool, in string, out Out
 	}
 }
 
+// TestClientRootCapabilities verifies that the server correctly observes
+// RootsV2 for various client capability configurations. This tests the fix
+// for #607.
+func TestClientRootCapabilities(t *testing.T) {
+	testCases := []struct {
+		name         string
+		capabilities *string // JSON for the capabilities field; nil means omit the field
+		wantRootsV2  *RootCapabilities
+	}{
+		{
+			name:         "capabilities field omitted",
+			capabilities: nil,
+			wantRootsV2:  nil,
+		},
+		{
+			name:         "empty capabilities",
+			capabilities: ptr(`{}`),
+			wantRootsV2:  nil,
+		},
+		{
+			name:         "capabilities with no roots",
+			capabilities: ptr(`{"sampling": {}}`),
+			wantRootsV2:  nil,
+		},
+		{
+			name:         "capabilities with empty roots",
+			capabilities: ptr(`{"roots": {}}`),
+			wantRootsV2:  &RootCapabilities{ListChanged: false},
+		},
+		{
+			name:         "capabilities with roots without listChanged",
+			capabilities: ptr(`{"roots": {"listChanged": false}}`),
+			wantRootsV2:  &RootCapabilities{ListChanged: false},
+		},
+		{
+			name:         "capabilities with roots with listChanged",
+			capabilities: ptr(`{"roots": {"listChanged": true}}`),
+			wantRootsV2:  &RootCapabilities{ListChanged: true},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			// Create a minimal server.
+			impl := &Implementation{Name: "testServer", Version: "v1.0.0"}
+			s := NewServer(impl, nil)
+
+			// Connect the server.
+			cTransport, sTransport := NewInMemoryTransports()
+			ss, err := s.Connect(ctx, sTransport, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Connect the client JSON-RPC connection (raw, no client).
+			cConn, err := cTransport.Connect(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Build initialize params, optionally including capabilities.
+			var initParams json.RawMessage
+			if tc.capabilities != nil {
+				initParams = json.RawMessage(`{
+					"protocolVersion": "2025-06-18",
+					"capabilities": ` + *tc.capabilities + `,
+					"clientInfo": {"name": "TestClient", "version": "1.0.0"}
+				}`)
+			} else {
+				initParams = json.RawMessage(`{
+					"protocolVersion": "2025-06-18",
+					"clientInfo": {"name": "TestClient", "version": "1.0.0"}
+				}`)
+			}
+
+			initReq, err := jsonrpc2.NewCall(jsonrpc2.Int64ID(1), "initialize", initParams)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := cConn.Write(ctx, initReq); err != nil {
+				t.Fatalf("Write failed: %v", err)
+			}
+
+			// Read the initialize response.
+			msg, err := cConn.Read(ctx)
+			if err != nil {
+				t.Fatalf("Read failed: %v", err)
+			}
+			resp, ok := msg.(*jsonrpc2.Response)
+			if !ok {
+				t.Fatalf("expected Response, got %T", msg)
+			}
+			if resp.Error != nil {
+				t.Fatalf("initialize failed: %v", resp.Error)
+			}
+
+			// Verify that the server session has the correct RootsV2 value.
+			params := ss.InitializeParams()
+			if params == nil {
+				t.Fatal("InitializeParams is nil")
+			}
+
+			var gotRootsV2 *RootCapabilities
+			if params.Capabilities != nil {
+				gotRootsV2 = params.Capabilities.RootsV2
+			}
+			if diff := cmp.Diff(tc.wantRootsV2, gotRootsV2); diff != "" {
+				t.Errorf("RootsV2 mismatch (-want +got):\n%s", diff)
+			}
+
+			// Close the client connection.
+			if err := cConn.Close(); err != nil {
+				t.Fatalf("Stream.Close failed: %v", err)
+			}
+			ss.Wait()
+		})
+	}
+}
+
 // TODO: move this to tool_test.go
 func TestToolForSchemas(t *testing.T) {
 	// Validate that toolForErr handles schemas properly.
@@ -547,10 +812,34 @@ func TestToolForSchemas(t *testing.T) {
 
 	var (
 		falseSchema = &schema{Not: &schema{}}
-		inSchema    = &schema{Type: "object", AdditionalProperties: falseSchema, Properties: map[string]*schema{"p": {Type: "integer"}}}
-		inSchema2   = &schema{Type: "object", AdditionalProperties: falseSchema, Properties: map[string]*schema{"p": {Type: "string"}}}
-		outSchema   = &schema{Type: "object", AdditionalProperties: falseSchema, Properties: map[string]*schema{"b": {Type: "boolean"}}}
-		outSchema2  = &schema{Type: "object", AdditionalProperties: falseSchema, Properties: map[string]*schema{"b": {Type: "integer"}}}
+		inSchema    = &schema{
+			Type:                 "object",
+			AdditionalProperties: falseSchema,
+			Properties:           map[string]*schema{"p": {Type: "integer"}},
+			PropertyOrder:        []string{"p"},
+		}
+		inSchema2 = &schema{
+			Type:                 "object",
+			AdditionalProperties: falseSchema,
+			Properties:           map[string]*schema{"p": {Type: "string"}},
+		}
+		inSchema3 = &schema{
+			Type:                 "object",
+			AdditionalProperties: falseSchema,
+			Properties:           map[string]*schema{}, // empty map is preserved
+		}
+		outSchema = &schema{
+			Type:                 "object",
+			AdditionalProperties: falseSchema,
+			Properties:           map[string]*schema{"b": {Type: "boolean"}},
+			PropertyOrder:        []string{"b"},
+		}
+		outSchema2 = &schema{
+			Type:                 "object",
+			AdditionalProperties: falseSchema,
+			Properties:           map[string]*schema{"b": {Type: "integer"}},
+			PropertyOrder:        []string{"b"},
+		}
 	)
 
 	// Infer both schemas.
@@ -564,6 +853,8 @@ func TestToolForSchemas(t *testing.T) {
 	testToolForSchema[in, any](t, &Tool{}, `{"p":"x"}`, 0, inSchema, nil, `want "integer"`)
 	// Tool sets input schema: that is what's used.
 	testToolForSchema[in, any](t, &Tool{InputSchema: inSchema2}, `{"p":3}`, 0, inSchema2, nil, `want "string"`)
+	// Tool sets input schema, empty properties map.
+	testToolForSchema[in, any](t, &Tool{InputSchema: inSchema3}, `{}`, 0, inSchema3, nil, "")
 	// Tool sets output schema: that is what's used, and validation happens.
 	testToolForSchema[in, any](t, &Tool{OutputSchema: outSchema2}, `{"p":3}`, out{true},
 		inSchema, outSchema2, `want "integer"`)
@@ -585,6 +876,92 @@ func TestToolForSchemas(t *testing.T) {
 				"AsOf":    {Type: "string"},
 				"Source":  {Type: "string"},
 			},
+			PropertyOrder: []string{"Summary", "AsOf", "Source"},
 		},
 		"")
+}
+
+// TestServerCapabilitiesOverWire verifies that server capabilities are
+// correctly sent over the wire during initialization.
+func TestServerCapabilitiesOverWire(t *testing.T) {
+	tool := &Tool{Name: "test-tool", InputSchema: &jsonschema.Schema{Type: "object"}}
+
+	testCases := []struct {
+		name             string
+		serverOpts       *ServerOptions
+		configureServer  func(s *Server)
+		wantCapabilities *ServerCapabilities
+	}{
+		{
+			name:            "Default capabilities",
+			serverOpts:      nil,
+			configureServer: func(s *Server) {},
+			wantCapabilities: &ServerCapabilities{
+				Logging: &LoggingCapabilities{},
+			},
+		},
+		{
+			name: "Custom Capabilities with tools",
+			serverOpts: &ServerOptions{
+				Capabilities: &ServerCapabilities{
+					Tools: &ToolCapabilities{ListChanged: false},
+				},
+			},
+			configureServer: func(s *Server) {},
+			wantCapabilities: &ServerCapabilities{
+				Tools: &ToolCapabilities{ListChanged: false},
+			},
+		},
+		{
+			name: "Dynamic tool capability",
+			serverOpts: &ServerOptions{
+				Capabilities: &ServerCapabilities{
+					Logging: &LoggingCapabilities{},
+				},
+			},
+			configureServer: func(s *Server) {
+				s.AddTool(tool, nil)
+			},
+			wantCapabilities: &ServerCapabilities{
+				Logging: &LoggingCapabilities{},
+				Tools:   &ToolCapabilities{ListChanged: true},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			// Create server.
+			impl := &Implementation{Name: "testServer", Version: "v1.0.0"}
+			server := NewServer(impl, tc.serverOpts)
+			tc.configureServer(server)
+
+			// Connect client and server.
+			cTransport, sTransport := NewInMemoryTransports()
+			ss, err := server.Connect(ctx, sTransport, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ss.Close()
+
+			client := NewClient(&Implementation{Name: "testClient", Version: "v1.0.0"}, nil)
+			cs, err := client.Connect(ctx, cTransport, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cs.Close()
+
+			// Check that the client received the expected capabilities.
+			initResult := cs.InitializeResult()
+			if initResult == nil {
+				t.Fatal("InitializeResult is nil")
+			}
+
+			if diff := cmp.Diff(tc.wantCapabilities, initResult.Capabilities); diff != "" {
+				t.Errorf("Capabilities mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
 }

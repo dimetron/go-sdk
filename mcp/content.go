@@ -9,7 +9,6 @@ package mcp
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 )
 
@@ -130,6 +129,8 @@ type ResourceLink struct {
 	Size        *int64
 	Meta        Meta
 	Annotations *Annotations
+	// Icons for the resource link, if any.
+	Icons []Icon `json:"icons,omitempty"`
 }
 
 func (c *ResourceLink) MarshalJSON() ([]byte, error) {
@@ -143,6 +144,7 @@ func (c *ResourceLink) MarshalJSON() ([]byte, error) {
 		Size:        c.Size,
 		Meta:        c.Meta,
 		Annotations: c.Annotations,
+		Icons:       c.Icons,
 	})
 }
 
@@ -155,6 +157,7 @@ func (c *ResourceLink) fromWire(wire *wireContent) {
 	c.Size = wire.Size
 	c.Meta = wire.Meta
 	c.Annotations = wire.Annotations
+	c.Icons = wire.Icons
 }
 
 // EmbeddedResource contains embedded resources.
@@ -185,37 +188,8 @@ type ResourceContents struct {
 	URI      string `json:"uri"`
 	MIMEType string `json:"mimeType,omitempty"`
 	Text     string `json:"text,omitempty"`
-	Blob     []byte `json:"blob,omitempty"`
+	Blob     []byte `json:"blob,omitzero"`
 	Meta     Meta   `json:"_meta,omitempty"`
-}
-
-func (r *ResourceContents) MarshalJSON() ([]byte, error) {
-	// If we could assume Go 1.24, we could use omitzero for Blob and avoid this method.
-	if r.URI == "" {
-		return nil, errors.New("ResourceContents missing URI")
-	}
-	if r.Blob == nil {
-		// Text. Marshal normally.
-		type wireResourceContents ResourceContents // (lacks MarshalJSON method)
-		return json.Marshal((wireResourceContents)(*r))
-	}
-	// Blob.
-	if r.Text != "" {
-		return nil, errors.New("ResourceContents has non-zero Text and Blob fields")
-	}
-	// r.Blob may be the empty slice, so marshal with an alternative definition.
-	br := struct {
-		URI      string `json:"uri,omitempty"`
-		MIMEType string `json:"mimeType,omitempty"`
-		Blob     []byte `json:"blob"`
-		Meta     Meta   `json:"_meta,omitempty"`
-	}{
-		URI:      r.URI,
-		MIMEType: r.MIMEType,
-		Blob:     r.Blob,
-		Meta:     r.Meta,
-	}
-	return json.Marshal(br)
 }
 
 // wireContent is the wire format for content.
@@ -237,6 +211,7 @@ type wireContent struct {
 	Size        *int64            `json:"size,omitempty"`
 	Meta        Meta              `json:"_meta,omitempty"`
 	Annotations *Annotations      `json:"annotations,omitempty"`
+	Icons       []Icon            `json:"icons,omitempty"`
 }
 
 func contentsFromWire(wires []*wireContent, allow map[string]bool) ([]Content, error) {

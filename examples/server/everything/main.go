@@ -7,6 +7,8 @@ package main
 
 import (
 	"context"
+	_ "embed"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
@@ -16,6 +18,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -50,25 +53,45 @@ func main() {
 		CompletionHandler: complete, // support completions by setting this handler
 	}
 
-	server := mcp.NewServer(&mcp.Implementation{Name: "everything"}, opts)
+	// Add an icon to the server implementation.
+	icons := mcpIcons()
+	server := mcp.NewServer(&mcp.Implementation{Name: "everything", WebsiteURL: "https://example.com", Icons: icons}, opts)
 
 	// Add tools that exercise different features of the protocol.
 	mcp.AddTool(server, &mcp.Tool{Name: "greet", Description: "say hi"}, contentTool)
-	mcp.AddTool(server, &mcp.Tool{Name: "greet (structured)"}, structuredTool) // returns structured output
-	mcp.AddTool(server, &mcp.Tool{Name: "ping"}, pingingTool)                  // performs a ping
-	mcp.AddTool(server, &mcp.Tool{Name: "log"}, loggingTool)                   // performs a log
-	mcp.AddTool(server, &mcp.Tool{Name: "sample"}, samplingTool)               // performs sampling
-	mcp.AddTool(server, &mcp.Tool{Name: "elicit"}, elicitingTool)              // performs elicitation
-	mcp.AddTool(server, &mcp.Tool{Name: "roots"}, rootsTool)                   // lists roots
+	mcp.AddTool(server, &mcp.Tool{Name: "greet (structured)"}, structuredTool)                                // returns structured output
+	mcp.AddTool(server, &mcp.Tool{Name: "greet (with Icons)", Icons: icons}, structuredTool)                  // tool with icons
+	mcp.AddTool(server, &mcp.Tool{Name: "greet (content with ResourceLink)"}, resourceLinkContentTool(icons)) // tool that returns content with a resource link
+	mcp.AddTool(server, &mcp.Tool{Name: "ping"}, pingingTool)                                                 // performs a ping
+	mcp.AddTool(server, &mcp.Tool{Name: "log"}, loggingTool)                                                  // performs a log
+	mcp.AddTool(server, &mcp.Tool{Name: "sample"}, samplingTool)                                              // performs sampling
+	mcp.AddTool(server, &mcp.Tool{Name: "elicit (form)"}, elicitFormTool)                                     // performs form elicitation
+	mcp.AddTool(server, &mcp.Tool{Name: "elicit (url)"}, elicitURLTool)                                       // performs url elicitation
+	mcp.AddTool(server, &mcp.Tool{Name: "roots"}, rootsTool)                                                  // lists roots
 
 	// Add a basic prompt.
 	server.AddPrompt(&mcp.Prompt{Name: "greet"}, prompt)
+	server.AddPrompt(&mcp.Prompt{Name: "greet (with Icons)", Icons: icons}, prompt) // greet prompt with icons
 
 	// Add an embedded resource.
 	server.AddResource(&mcp.Resource{
 		Name:     "info",
 		MIMEType: "text/plain",
 		URI:      "embedded:info",
+	}, embeddedResource)
+	server.AddResource(&mcp.Resource{ // text resource with icons
+		Name:     "info (with Icons)",
+		MIMEType: "text/plain",
+		URI:      "embedded:info",
+		Icons:    icons,
+	}, embeddedResource)
+
+	// Add a resource template.
+	server.AddResourceTemplate(&mcp.ResourceTemplate{
+		Name:        "Resource template (with Icon)",
+		MIMEType:    "text/plain",
+		URITemplate: "http://example.com/~{resource_name}/",
+		Icons:       icons,
 	}, embeddedResource)
 
 	// Serve over stdio, or streamable HTTP if -http is set.
@@ -140,6 +163,23 @@ func contentTool(ctx context.Context, req *mcp.CallToolRequest, args args) (*mcp
 	}, nil, nil
 }
 
+// resourceLinkContentTool returns a ResourceLink content with icons.
+func resourceLinkContentTool(icons []mcp.Icon) func(ctx context.Context, req *mcp.CallToolRequest, args args) (*mcp.CallToolResult, any, error) {
+	return func(ctx context.Context, req *mcp.CallToolRequest, args args) (*mcp.CallToolResult, any, error) {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.ResourceLink{
+					Name:     "greeting",
+					Title:    "A friendly greeting",
+					MIMEType: "text/plain",
+					URI:      "data:text/plain,Hi%20" + url.PathEscape(args.Name),
+					Icons:    icons,
+				},
+			},
+		}, nil, nil
+	}
+}
+
 type result struct {
 	Message string `json:"message" jsonschema:"the message to convey"`
 }
@@ -194,7 +234,7 @@ func samplingTool(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.Ca
 	}, nil, nil
 }
 
-func elicitingTool(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+func elicitFormTool(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
 	res, err := req.Session.Elicit(ctx, &mcp.ElicitParams{
 		Message: "provide a random string",
 		RequestedSchema: &jsonschema.Schema{
@@ -214,6 +254,26 @@ func elicitingTool(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.C
 	}, nil, nil
 }
 
+var elicitations atomic.Int32
+
+func elicitURLTool(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+	elicitID := fmt.Sprintf("%d", elicitations.Add(1))
+	_, err := req.Session.Elicit(ctx, &mcp.ElicitParams{
+		Message:       "submit a string",
+		URL:           fmt.Sprintf("http://localhost:6062?id=%s", elicitID),
+		ElicitationID: elicitID,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("eliciting failed: %v", err)
+	}
+	// TODO: actually wait for the elicitation form to be submitted.
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: "(elicitation pending)"},
+		},
+	}, nil, nil
+}
+
 func complete(ctx context.Context, req *mcp.CompleteRequest) (*mcp.CompleteResult, error) {
 	return &mcp.CompleteResult{
 		Completion: mcp.CompletionResultDetails{
@@ -221,4 +281,16 @@ func complete(ctx context.Context, req *mcp.CompleteRequest) (*mcp.CompleteResul
 			Values: []string{req.Params.Argument.Value + "x"},
 		},
 	}, nil
+}
+
+//go:embed mcp.png
+var mcpIconData []byte
+
+func mcpIcons() []mcp.Icon {
+	return []mcp.Icon{{
+		Source:   "data:image/png;base64," + base64.StdEncoding.EncodeToString(mcpIconData),
+		MIMEType: "image/png",
+		Sizes:    []string{"48x48"},
+		Theme:    mcp.IconThemeLight,
+	}}
 }
